@@ -1,24 +1,208 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+# -*- coding: utf-8 -*-
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
-class MyPlugin(Star):
-    def __init__(self, context: Context):
+from datetime import datetime
+import json
+from pathlib import Path
+
+from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.provider import ProviderRequest, LLMResponse
+from astrbot.api.star import Context, Star, register
+from astrbot.api import logger, AstrBotConfig
+
+from .utils import sec2str, ts2str
+
+
+@register(
+    "astrbot_plugin_llm_mute",
+    "LLMMute",
+    "AstrBot 大模型生成禁言控制",
+    "0.0.1",
+)
+class LLMMutePlugin(Star):
+    PERSISTENCE_FILE_PATH = "data/llm_mute/data.json"
+
+    def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+        self.config = config
+
+        self.muted_until: dict[str, float] = {}  # 各sid禁言结束时间
+        self.generating: set[str] = set()  # 正在生成的sid
+        self.last_generated: dict[str, float] = {}  # 上一次sid响应结束时间
 
     async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
-
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
+        if self.config["persistence"]["enabled"]:
+            self._load()
 
     async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        if self.config["persistence"]["enabled"]:
+            self._save()
+
+    def _save(self):
+        """保存数据"""
+
+        try:
+            file_path = Path(self.PERSISTENCE_FILE_PATH)
+            if not file_path.parent.exists():
+                file_path.parent.mkdir(parents=True)
+            with file_path.open("w", encoding="utf-8") as fp:
+                json.dump(
+                    {
+                        "muted_until": self.muted_until,
+                        "last_generated": self.last_generated,
+                    },
+                    fp,
+                    ensure_ascii=False,
+                    indent=4,
+                )
+        except Exception as e:
+            logger.error(f"LLMMute 持久化数据保存失败: {e}")
+
+    def _load(self):
+        """加载数据"""
+
+        try:
+            file_path = Path(self.PERSISTENCE_FILE_PATH)
+            if not file_path.exists():
+                return
+            with file_path.open("r", encoding="utf-8") as fp:
+                data: dict = json.load(fp)
+                self.muted_until = data.get("muted_until") or dict()
+                self.last_generated = data.get("last_generated") or dict()
+            logger.info("LLMMute 持久化数据加载成功")
+        except Exception as e:
+            logger.error(f"LLMMute 持久化数据加载失败: {e}")
+
+    def _is_muted(self, sid: str):
+        """该会话是否被禁言"""
+
+        if sid not in self.muted_until:
+            return False
+
+        current_ts = datetime.now().timestamp()
+        unmute_ts = self.muted_until[sid]
+        if current_ts < unmute_ts:
+            return True
+        else:
+            self.muted_until.pop(sid, None)
+            return False
+
+    def _mute(self, sid: str, duration: int | None = None):
+        """禁言会话"""
+
+        if duration is None:
+            duration = int(self.config["mute_command"]["default_duration"])
+
+        muted_until = datetime.now().timestamp() + duration
+        self.muted_until[sid] = muted_until
+        logger.info(
+            f"LLM 禁言 {sec2str(duration)}, 结束时间: {ts2str(muted_until)} ({sid=})"
+        )
+
+        if self.config["persistence"]["enabled"]:
+            self._save()
+
+    def _unmute(self, sid: str):
+        """解除会话禁言"""
+
+        if sid not in self.muted_until:
+            return False
+
+        self.muted_until.pop(sid, None)
+        logger.info(f"LLM 解除禁言 ({sid=})")
+
+        if self.config["persistence"]["enabled"]:
+            self._save()
+
+        return True
+
+    def get_mute_left_time(self, sid: str):
+        """获取会话禁言剩余时间"""
+
+        if sid not in self.muted_until:
+            return "未禁言"
+
+        current_ts = datetime.now().timestamp()
+        unmute_ts = self.muted_until[sid]
+        total = unmute_ts - current_ts
+
+        return sec2str(total)
+
+    def get_mute_until_time(self, sid: str):
+        """获取会话禁言结束时间"""
+
+        if sid not in self.muted_until:
+            return "未禁言"
+
+        return ts2str(self.muted_until[sid])
+
+    @filter.on_llm_request()
+    async def on_llm_req(
+        self, event: AstrMessageEvent, request: ProviderRequest, *args, **kwargs
+    ):
+        """LLM 请求拦截"""
+
+        sid = event.get_session_id()
+        msg_time = event.message_obj.timestamp
+
+        if self._is_muted(sid):
+            logger.info(
+                f"LLM 禁言中, 忽略请求 ({sid=}, 剩余时间: {self.get_mute_left_time(sid)})"
+            )
+            event.stop_event()
+            return
+
+        last_generated = self.last_generated.get(sid, 0)
+        logger.debug(f"消息时间: {msg_time}, 上次响应时间: {last_generated}")
+        if msg_time - last_generated < self.config["llm_interval"]["interval"]:
+            logger.info(f"LLM 请求间隔过短, 忽略请求 ({sid=})")
+            event.stop_event()
+            return
+
+        if sid in self.generating:
+            logger.info(f"LLM 正在生成中, 忽略请求 ({sid=})")
+            event.stop_event()
+            return
+
+        self.generating.add(sid)
+
+    @filter.on_llm_response()
+    async def on_llm_resp(
+        self, event: AstrMessageEvent, resp: LLMResponse, *args, **kwargs
+    ):
+        """LLM 响应结束记录"""
+        sid = event.get_session_id()
+
+        if sid in self.generating:
+            self.generating.remove(sid)  # 移除生成标记
+        self.last_generated[sid] = datetime.now().timestamp()  # 记录响应结束时间
+
+    @filter.command("llm_mute")
+    async def llm_mute_command(
+        self, event: AstrMessageEvent, duration: int | None = None
+    ):
+        """禁言 LLM 指令 /llm_mute"""
+
+        sid = event.get_session_id()
+        if self.config["mute_command"]["enabled"] and event.is_admin():
+            if duration is None:
+                self._mute(sid)
+            else:
+                self._mute(sid, duration)
+            yield event.plain_result(
+                (
+                    f"已禁言 LLM {self.get_mute_left_time(sid)}\n"
+                    f"解封时间: {self.get_mute_until_time(sid)}"
+                )
+            )
+
+    @filter.command("llm_unmute")
+    async def llm_unmute_command(self, event: AstrMessageEvent):
+        """解除 LLM 禁言指令 /llm_unmute"""
+
+        sid = event.get_session_id()
+        if (
+            self.config["mute_command"]["enabled"]
+            and event.is_admin()
+            and self._unmute(sid)
+        ):
+            yield event.plain_result("已解除 LLM 禁言")

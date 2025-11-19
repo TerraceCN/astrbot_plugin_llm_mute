@@ -1,0 +1,49 @@
+{
+    "persistence": {
+        "description": "持久化配置",
+        "type": "object",
+        "items": {
+            "enabled": {
+                "description": "是否启用持久化",
+                "type": "bool",
+                "default": true
+            }
+        }
+    },
+    "mute_command": {
+        "description": "大模型禁言配置",
+        "type": "object",
+        "items": {
+            "enabled": {
+                "description": "是否允许使用禁言命令",
+                "hint": "指令/llm_mute和/llm_unmute",
+                "type": "bool",
+                "default": true
+            },
+            "default_duration": {
+                "description": "默认禁言时长",
+                "hint": "单位为秒",
+                "type": "int",
+                "default": 3600
+            }
+        }
+    },
+    "llm_interval": {
+        "description": "大模型生成间隔配置",
+        "type": "object",
+        "items": {
+            "enabled": {
+                "description": "是否开启生成间隔",
+                "hint": "开启后, 同一会话中大模型响应结束后, 需要等待指定时间间隔后才能再次响应",
+                "type": "bool",
+                "default": true
+            },
+            "interval": {
+                "description": "生成时间间隔",
+                "hint": "单位为秒",
+                "type": "int",
+                "default": 5
+            }
+        }
+    }
+}

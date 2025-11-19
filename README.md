@@ -1,8 +1,6 @@
-# helloworld
+# FixEdit
 
-AstrBot 插件模板
-
-A template plugin for AstrBot plugin feature
+AstrBot 大模型生成禁言控制
 
 # 支持
 
